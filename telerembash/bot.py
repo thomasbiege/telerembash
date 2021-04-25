@@ -6,10 +6,16 @@
 from __future__ import division, absolute_import, print_function
 
 import os
+import stat
+import select
 import re
 import time
 import subprocess
 import logging
+
+import json
+import requests
+import threading
 
 from aiogram import Bot, Dispatcher, executor, types, filters
 import pyotp
@@ -20,7 +26,69 @@ log = logging.getLogger(__name__)
 
 REX_AUTH = r'/auth\s+([0-9]{6})'
 REX_DO = r'/do\s+([a-z0-9]+)\s?(.*)'
+SET_ENFWD = "/enable_fwd"
+SET_DIFWD = "/disable_fwd"
 
+# https://api.telegram.org/bot<your-bot-token>/sendMessage?chat_id=<chat-id>&text=TestReply
+APIURL = "https://api.telegram.org/"
+
+global flg_enable_fwd
+
+class tFifo_IO(threading.Thread):
+    def __init__(self, fifo_path, chatid, token):
+        threading.Thread.__init__(self)
+        self.fifo_path = fifo_path
+        self.chat_id = chatid
+        self.token = token
+
+        log.warning("init: FIFO thread")
+
+        ### open fifo
+        # we don't set or check for lock files and let the systemd take care of us
+        flg_enable_fwd = True
+        self.fd = -1
+        # create fifo if it is not there already
+        if not os.path.exists(self.fifo_path):
+            try:
+                oldumask = os.umask(0)
+                os.mkfifo(self.fifo_path)
+                os.umask(oldumask)
+            except OSError as err:
+                log.warning("OS error: {0}".format(err)) # maybe missing write perms
+                raise
+        elif not stat.S_ISFIFO(os.stat(self.fifo_path).st_mode):
+            raise AttributeError("fifo_path points to no FIFO, or permissions are missing")
+
+        # open the fifo now
+        try:
+            self.fd = os.open(self.fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as err:
+            log.warning("OS error: {0}".format(err)) # maybe missing write perms
+            raise
+
+    def send_web_msg(self, cid, line):
+        # https://www.codementor.io/@garethdwyer/building-a-telegram-bot-using-python-part-1-goi5fncay
+        # XXX would be nice to have a better way using aiogram
+        # https://api.telegram.org/bot<your-bot-token>/sendMessage?text=<text>&chat_id=<chat-id>
+        url = APIURL + "bot{}".format(self.token) + "/sendMessage?&chat_id={}&text={}".format(cid, line)
+        response = requests.get(url)
+        content = response.content.decode("utf8")
+        return content
+ 
+    def run(self):
+        self.rdesc = []
+        self.wdesc = []
+        self.xdesc = []
+        self.rdesc.append(self.fd)
+        fbuf = os.fdopen(self.fd)
+        while True:
+            rl, _, _ = select.select([self.fd], [], [], 5)
+            #line = fbuf.read()
+            for line in fbuf:
+                #print("run: read line")
+                #time.sleep(5)
+                if len(line) > 0:  # and flg_enable_fwd == True:
+                    self.send_web_msg(self.chat_id, line)
 
 class TeleRemBot(pp.WithParams):
     class Params(pp.Params):
@@ -31,6 +99,7 @@ class TeleRemBot(pp.WithParams):
         scripts_timeout = pp.Param(30, dtype=int, doc="execution timeout in seconds")
         username = pp.Param(None, dtype=str, doc="Username of the authorized user")
         user_id = pp.Param(None, dtype=int, doc="User IDs of the authorized user")
+        fifo_path = pp.Param("/var/run/telerem_fifo", dtype=str, doc="FIFO to receive system messages to forward them to Telegram via our bot.")
 
         @staticmethod
         def resolve_path(path):
@@ -52,7 +121,7 @@ class TeleRemBot(pp.WithParams):
         self.user_whitelist = [self.params.username]
         self.user_id_whitelist = [self.params.user_id]
         self.chat_id_whitelist = []
-
+        
         # Initialize bot and dispatcher
         self.bot = Bot(token=self.params.api_token)
         self.dp = Dispatcher(self.bot)
@@ -63,6 +132,7 @@ class TeleRemBot(pp.WithParams):
                                          filters.RegexpCommandsFilter(regexp_commands=[REX_DO]))
         self.dp.register_message_handler(self.default_message_handler)
 
+        
     def _precondition_fail(self, message: types.Message, field: str, value: str):
         log.warning(f"pre-condition fail: {field}:[{value}]: {message.to_python()}")
 
@@ -106,6 +176,10 @@ class TeleRemBot(pp.WithParams):
         await message.answer(f"Welcome, {username}!")
         await self.execute_script(message, 'welcome', '', silent_if_not_found=True)
 
+        # start thread to handle fifo IO
+        t = tFifo_IO(self.params.fifo_path, message.chat.id, self.params.api_token)
+        t.start()
+
     # @dp.message_handler(filters.RegexpCommandsFilter(regexp_commands=[r'/do\s+([a-z0-9]+)\s?(.*)']))
     async def cmd_do_execute(self, message: types.Message, regexp_command: re.Match):
         if not self.check_preconditions(message):
@@ -143,7 +217,9 @@ class TeleRemBot(pp.WithParams):
             return
         await message.reply("Don't understand")
 
+     
     def main(self):
         import telerembash as tb
         print(f"TeleRemBash v{tb.__version__}")
         executor.start_polling(self.dp, skip_updates=True)
+
